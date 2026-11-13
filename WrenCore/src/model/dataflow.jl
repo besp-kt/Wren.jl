@@ -40,14 +40,16 @@ struct DataflowAnalysisState
     # The subset of `lhs_syms` that were seen again in a later expression, which we thus
     # need the values of
     required_syms::Set{Symbol}
-    # Generated quantities assumed not to be required. Uses inside their expressions are
-    # recorded in `gq_uses` instead of `required_syms`, because those expressions are only
-    # evaluated when a generated quantity that depends on them is requested.
+    # Generated quantities that are not required, i.e. whose expressions are only
+    # evaluated when a generated quantity that depends on them is requested. This is
+    # filled in by `analyse_dataflow` after the traversal.
     skippable_gqs::Set{Symbol}
-    # For each generated quantity in `skippable_gqs`, the `lhs_syms` used in its expression
+    # For each generated quantity, the `lhs_syms` used in its expression. Uses inside
+    # generated quantity expressions are recorded here instead of `required_syms`, because
+    # whether they are required depends on whether the generated quantity is required.
     gq_uses::Dict{Symbol,Set{Symbol}}
-    # The skippable generated quantity whose expression is being traversed, if any
-    enclosing_skippable_gq::Base.RefValue{Union{Nothing,Symbol}}
+    # The generated quantity whose expression is being traversed, if any
+    enclosing_gq::Base.RefValue{Union{Nothing,Symbol}}
     # All model arguments
     args::Set{Symbol}
     # Arguments which have potentially been written to
@@ -55,13 +57,13 @@ struct DataflowAnalysisState
     # Dirty arguments which have potentially been read from again
     args_to_copy::Set{Symbol}
 end
-function DataflowAnalysisState(args::Set{Symbol}, skippable_gqs::Set{Symbol})
+function DataflowAnalysisState(args::Set{Symbol})
     return DataflowAnalysisState(
         Set{Symbol}(),
         Set{Symbol}(),
         Set{Symbol}(),
         Set{Symbol}(),
-        skippable_gqs,
+        Set{Symbol}(),
         Dict{Symbol,Set{Symbol}}(),
         Ref{Union{Nothing,Symbol}}(nothing),
         args,
@@ -78,7 +80,7 @@ function mark_symbol_used!(state::DataflowAnalysisState, syms::Set{Symbol})
     # Record that we've used `syms` in a later expression. In general, 'use' means
     # that the symbol may have been both written to and read from.
     used_lhs_syms = intersect(state.lhs_syms, syms)
-    enclosing_gq = state.enclosing_skippable_gq[]
+    enclosing_gq = state.enclosing_gq[]
     if enclosing_gq === nothing
         union!(state.required_syms, used_lhs_syms)
     else
@@ -171,13 +173,9 @@ function parse_variables!(stmt::AddLogLikelihood, state::DataflowAnalysisState)
     return nothing
 end
 function parse_variables!(stmt::GeneratedQuantity, state::DataflowAnalysisState)
-    if stmt.name in state.skippable_gqs
-        state.enclosing_skippable_gq[] = stmt.name
-        parse_variables!(stmt.expr, state)
-        state.enclosing_skippable_gq[] = nothing
-    else
-        parse_variables!(stmt.expr, state)
-    end
+    state.enclosing_gq[] = stmt.name
+    parse_variables!(stmt.expr, state)
+    state.enclosing_gq[] = nothing
     mark_lhs_symbol!(state, stmt.name)
     push!(state.gq_syms, stmt.name)
     return nothing
@@ -272,44 +270,42 @@ function reconstruct_statement(expr::WrenExpr, result::DataflowAnalysisResult)
     return WrenExpr(expr.head, new_args)
 end
 
-function analyse_dataflow_once(
+# A generated quantity is required if a statement other than a generated quantity uses it,
+# or if a required generated quantity uses it. Uses inside generated quantities are
+# recorded in `gq_uses` during the traversal, and then propagated from the required
+# generated quantities in a flood fill.
+function analyse_dataflow(
     stmts::Vector{Union{AbstractWrenExpr,LineNumberNode}},
     args::Set{Symbol},
-    skippable_gqs::Set{Symbol},
 )
-    state = DataflowAnalysisState(args, skippable_gqs)
+    state = DataflowAnalysisState(args)
     for stmt in stmts
         parse_variables!(stmt, state)
     end
+    # Flood fill: everything used by a required generated quantity is required too.
+    frontier = collect(intersect(state.required_syms, state.gq_syms))
+    while !isempty(frontier)
+        gq = pop!(frontier)
+        for sym in get(state.gq_uses, gq, ())
+            if !(sym in state.required_syms)
+                push!(state.required_syms, sym)
+                sym in state.gq_syms && push!(frontier, sym)
+            end
+        end
+    end
+    union!(state.skippable_gqs, setdiff(state.gq_syms, state.required_syms))
     # A skippable generated quantity is only evaluated alongside the generated quantities
     # that depend on it, but any sampled variable it uses must always be bound.
     for used_syms in values(state.gq_uses)
         union!(state.required_syms, intersect(used_syms, state.sample_syms))
     end
-    return state
-end
-
-# Each pass can only add generated quantities to `skippable_gqs`, and there are finitely
-# many of them, so the loop terminates.
-function analyse_dataflow(
-    stmts::Vector{Union{AbstractWrenExpr,LineNumberNode}},
-    args::Set{Symbol},
-)
-    skippable_gqs = Set{Symbol}()
-    while true
-        state = analyse_dataflow_once(stmts, args, skippable_gqs)
-        unrequired_gqs = setdiff(state.gq_syms, state.required_syms)
-        if unrequired_gqs == skippable_gqs
-            if WREN_COMPILATION_DEBUG[]
-                @info "[dataflow.jl] lhs_syms = $(state.lhs_syms)"
-                @info "[dataflow.jl] required_syms = $(state.required_syms)"
-                @info "[dataflow.jl] gq_uses = $(state.gq_uses)"
-                @info "[dataflow.jl] args_to_copy = $(state.args_to_copy)"
-            end
-            return state
-        end
-        skippable_gqs = unrequired_gqs
+    if WREN_COMPILATION_DEBUG[]
+        @info "[dataflow.jl] lhs_syms = $(state.lhs_syms)"
+        @info "[dataflow.jl] required_syms = $(state.required_syms)"
+        @info "[dataflow.jl] gq_uses = $(state.gq_uses)"
+        @info "[dataflow.jl] args_to_copy = $(state.args_to_copy)"
     end
+    return state
 end
 
 function get_required_syms_and_args(
